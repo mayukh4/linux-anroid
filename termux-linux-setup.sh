@@ -12,7 +12,11 @@
 #  Tested on: LineageOS (Android 9+), arm64 devices
 #######################################################
 
-set -euo pipefail
+# Intentionally avoiding set -e (exit on error) and set -u (nounset):
+# - set -e would silently kill the script on any failed package install
+# - set -u crashes on unbound variables, which can legitimately be empty in Termux
+# pipefail is kept so piped commands report failures correctly.
+set -o pipefail
 
 # ============== DYNAMIC PATH DETECTION ==============
 # Supports both standard and custom Termux installs
@@ -308,11 +312,32 @@ step_gpu() {
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Installing GPU acceleration...${NC}"
     echo ""
 
-    install_pkg "mesa-zink"            "Mesa Zink (OpenGL on Vulkan)"
-    install_pkg "vulkan-loader-android" "Vulkan Loader"
+    # mesa-zink: OpenGL implementation built on top of Vulkan (confirmed available)
+    install_pkg "mesa-zink" "Mesa Zink (OpenGL on Vulkan)"
+
+    # vulkan-loader-android and vulkan-loader-generic conflict with each other.
+    # Check which one is already installed and skip the other.
+    if dpkg -s vulkan-loader-generic &>/dev/null; then
+        echo -e "  ${GRAY}  vulkan-loader-generic already installed — skipping vulkan-loader-android (they conflict).${NC}"
+        log "Skipped vulkan-loader-android: vulkan-loader-generic already present."
+    elif dpkg -s vulkan-loader-android &>/dev/null; then
+        echo -e "  ${GRAY}  vulkan-loader-android already installed.${NC}"
+        log "vulkan-loader-android already present."
+    else
+        install_pkg "vulkan-loader-android" "Vulkan Loader"
+    fi
+
+    # vulkan-icd: metapackage that pulls in the right ICD for your device
+    install_pkg "vulkan-icd" "Vulkan ICD (device ICDs)"
 
     if [ "$GPU_DRIVER" == "freedreno" ]; then
-        install_pkg "mesa-vulkan-icd-freedreno" "Turnip Adreno Vulkan Driver"
+        # Both the standard and zink-specific Freedreno ICDs — install both for coverage
+        install_pkg "mesa-vulkan-icd-freedreno"      "Freedreno Vulkan ICD (Turnip)"
+        install_pkg "mesa-zink-vulkan-icd-freedreno" "Mesa Zink Freedreno ICD"
+    else
+        # Non-Adreno fallback: software Vulkan rasterizer
+        install_pkg "mesa-vulkan-icd-swrast"      "SwRast Vulkan ICD (software)"
+        install_pkg "mesa-zink-vulkan-icd-swrast" "Mesa Zink SwRast ICD"
     fi
 }
 
@@ -606,6 +631,15 @@ main() {
     echo "" > "$LOG_FILE"
     log "termux-linux-setup.sh started"
 
+    # Prevent Android from suspending Termux mid-install when screen turns off
+    if command -v termux-wake-lock &>/dev/null; then
+        termux-wake-lock
+        log "Wake lock acquired."
+    else
+        echo -e "${YELLOW}  [!] termux-wake-lock unavailable — keep your screen on during install.${NC}"
+        echo ""
+    fi
+
     show_banner
     setup_environment
 
@@ -626,6 +660,12 @@ main() {
     step_shortcuts
 
     show_completion
+
+    # Release wake lock now that install is done
+    if command -v termux-wake-unlock &>/dev/null; then
+        termux-wake-unlock
+        log "Wake lock released."
+    fi
 }
 
 main
