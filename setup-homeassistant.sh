@@ -22,7 +22,7 @@ TERMUX_HOME="${HOME:-/data/data/com.termux/files/home}"
 
 # ============== CONFIGURATION ==============
 CURRENT_STEP=0
-TOTAL_STEPS=6
+TOTAL_STEPS=7
 
 LOG_FILE="$TERMUX_HOME/termux-setup.log"
 
@@ -273,68 +273,109 @@ step_homeassistant() {
     echo ""
 
     # Create venv if it doesn't exist
-    if proot-distro login ubuntu -- test -d ~/hass-venv; then
+    if proot-distro login ubuntu -- test -d "${TERMUX_HOME}/hass-venv"; then
         printf "  ${GRAY}~${NC}  %-55s ${GRAY}(already exists)${NC}\n" "Python virtual environment"
     else
-        (proot-distro login ubuntu -- python3 -m venv ~/hass-venv \
+        (proot-distro login ubuntu -- python3 -m venv "${TERMUX_HOME}/hass-venv" \
             >> "$LOG_FILE" 2>&1) &
         spinner $! "Creating Python virtual environment..."
     fi
 
     # Upgrade pip inside the venv
-    (proot-distro login ubuntu -- bash -c \
-        "source ~/hass-venv/bin/activate && pip install --upgrade pip wheel setuptools" \
+    # NOTE: Call venv binaries directly — "source activate" fails inside proot
+    (proot-distro login ubuntu -- ${TERMUX_HOME}/hass-venv/bin/pip install --upgrade pip wheel setuptools \
         >> "$LOG_FILE" 2>&1) &
     spinner $! "Upgrading pip and setuptools..."
 
-    # Install Home Assistant Core
-    (proot-distro login ubuntu -- bash -c \
-        "source ~/hass-venv/bin/activate && pip install homeassistant" \
+    # Install Home Assistant Core.
+    # HA lazy-loads many components whose deps aren't pulled in by pip.
+    # We explicitly install the ones needed for the core UI to function.
+    (proot-distro login ubuntu -- ${TERMUX_HOME}/hass-venv/bin/pip install \
+        homeassistant \
+        hassil home-assistant-intents pyspeex-noise \
+        numpy av mutagen pymicro-vad ha-ffmpeg PyTurboJPEG PyNaCl \
+        cached-ipaddress file-read-backwards go2rtc-client async-upnp-client \
         >> "$LOG_FILE" 2>&1) &
     spinner $! "Installing Home Assistant Core (this takes a while)..."
+
+    # Patch ifaddr: Android 10+ blocks getifaddrs() inside proot, causing
+    # PermissionError in HA's network detection. We patch the library to
+    # return an empty adapter list instead of crashing. HA still works fine
+    # because we explicitly set server_host in configuration.yaml.
+    local IFADDR_POSIX="${TERMUX_HOME}/hass-venv/lib/python3.*/site-packages/ifaddr/_posix.py"
+    proot-distro login ubuntu -- bash -c \
+        "sed -i 's/        raise OSError(eno, os.strerror(eno))/        return []/g' ${IFADDR_POSIX}" \
+        >> "$LOG_FILE" 2>&1
+    echo -e "  ${GREEN}✔${NC}  Patched ifaddr for Android network compatibility."
 }
 
-# ============== STEP 5: CREATE LAUNCHER SCRIPTS ==============
+# ============== STEP 5: INITIALIZE HA CONFIG ==============
+step_ha_config() {
+    update_progress
+    echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Initializing Home Assistant config...${NC}"
+    echo ""
+
+    # Create config dir and write configuration.yaml directly.
+    # We skip the "run HA once to generate config" approach — it's fragile
+    # inside proot. Instead we create a minimal valid config ourselves.
+    local HASS_CONFIG="${TERMUX_HOME}/hass-config"
+
+    if proot-distro login ubuntu -- test -f "${HASS_CONFIG}/configuration.yaml"; then
+        printf "  ${GRAY}~${NC}  %-55s ${GRAY}(already exists)${NC}\n" "HA config directory"
+    else
+        proot-distro login ubuntu -- mkdir -p "${HASS_CONFIG}"
+        echo -e "  ${GREEN}✔${NC}  Created config directory."
+    fi
+
+    # Ensure HA is accessible from the local network (not just localhost).
+    # NOTE: must use double quotes so ${HASS_CONFIG} expands from Termux.
+    if proot-distro login ubuntu -- grep -q "server_host" "${HASS_CONFIG}/configuration.yaml" 2>/dev/null; then
+        printf "  ${GRAY}~${NC}  %-55s ${GRAY}(already configured)${NC}\n" "Network binding (0.0.0.0)"
+    else
+        proot-distro login ubuntu -- sh -c "printf 'homeassistant:\nhttp:\n  server_host: 0.0.0.0\n' > ${HASS_CONFIG}/configuration.yaml"
+        echo -e "  ${GREEN}✔${NC}  Configured HA to accept connections from your network."
+    fi
+}
+
+# ============== STEP 6: CREATE LAUNCHER SCRIPTS ==============
 step_launchers() {
     update_progress
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Creating start/stop scripts...${NC}"
     echo ""
 
     # start-homeassistant.sh
-    cat > "$TERMUX_HOME/start-homeassistant.sh" << 'STARTEOF'
-#!/data/data/com.termux/files/usr/bin/bash
+    # NOTE: proot-distro shares the Termux filesystem. The venv and config live
+    # at the Termux home path, NOT at /root/. We bake the absolute path into
+    # the script so ~ expansion can't break it.
+    local HASS_BIN="${TERMUX_HOME}/hass-venv/bin/hass"
+    local HASS_CFG="${TERMUX_HOME}/hass-config"
+
+    cat > "$TERMUX_HOME/start-homeassistant.sh" << STARTEOF
+#!${TERMUX_PREFIX}/bin/bash
 echo ""
 echo "[*] Starting Home Assistant Core..."
 echo ""
 
-# Acquire wake lock to keep Termux alive
 if command -v termux-wake-lock &>/dev/null; then
     termux-wake-lock
-    echo "[*] Wake lock acquired — Termux will stay active."
+    echo "[*] Wake lock acquired."
 fi
 
-# Detect phone IP
-PHONE_IP=$(ip addr show wlan0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1)
-if [ -z "$PHONE_IP" ]; then
-    PHONE_IP="localhost"
-fi
+PHONE_IP=\$(ip addr show wlan0 2>/dev/null | grep 'inet ' | awk '{print \$2}' | cut -d/ -f1)
 
-echo "[*] Launching Home Assistant inside Ubuntu container..."
-echo ""
-echo "─────────────────────────────────────────────────"
+echo "-----------------------------------------------------"
 echo "  Home Assistant is starting up."
 echo ""
-echo "  First launch takes 5–10 minutes to initialize."
+echo "  First launch takes 5-10 minutes to initialize."
 echo "  When ready, open in your browser:"
 echo ""
-echo "    http://${PHONE_IP}:8123"
+echo "    http://\${PHONE_IP:-localhost}:8123"
 echo ""
 echo "  Press Ctrl+C to stop."
-echo "─────────────────────────────────────────────────"
+echo "-----------------------------------------------------"
 echo ""
 
-proot-distro login ubuntu -- bash -c \
-    "source ~/hass-venv/bin/activate && hass -c ~/hass-config"
+proot-distro login ubuntu -- "${HASS_BIN}" -c "${HASS_CFG}"
 STARTEOF
     chmod +x "$TERMUX_HOME/start-homeassistant.sh"
     echo -e "  ${GREEN}✔ Created ~/start-homeassistant.sh${NC}"
@@ -344,38 +385,33 @@ STARTEOF
 #!/data/data/com.termux/files/usr/bin/bash
 echo "[*] Stopping Home Assistant..."
 
-# Kill the hass process inside proot
-# proot processes show up as regular processes in Termux's process tree
-pkill -f "hass -c" 2>/dev/null || true
-pkill -f "homeassistant" 2>/dev/null || true
+pkill -f "hass" 2>/dev/null || true
 
-# Release wake lock
 if command -v termux-wake-unlock &>/dev/null; then
     termux-wake-unlock
     echo "[*] Wake lock released."
 fi
 
-echo "[✔] Home Assistant stopped."
+echo "[*] Home Assistant stopped."
 STOPEOF
     chmod +x "$TERMUX_HOME/stop-homeassistant.sh"
     echo -e "  ${GREEN}✔ Created ~/stop-homeassistant.sh${NC}"
 }
 
-# ============== STEP 6: VERIFY INSTALLATION ==============
+# ============== STEP 7: VERIFY INSTALLATION ==============
 step_verify() {
     update_progress
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Verifying installation...${NC}"
     echo ""
 
     # Check that hass binary exists in the venv
-    if proot-distro login ubuntu -- bash -c \
-        "source ~/hass-venv/bin/activate && which hass" &>/dev/null; then
+    # NOTE: Call venv binaries directly — "source activate" fails inside proot
+    if proot-distro login ubuntu -- ${TERMUX_HOME}/hass-venv/bin/hass --version &>/dev/null; then
         echo -e "  ${GREEN}✔${NC}  Home Assistant binary found."
         log "Verification OK: hass binary found"
 
         local HA_VERSION
-        HA_VERSION=$(proot-distro login ubuntu -- bash -c \
-            "source ~/hass-venv/bin/activate && hass --version" 2>/dev/null)
+        HA_VERSION=$(proot-distro login ubuntu -- ${TERMUX_HOME}/hass-venv/bin/hass --version 2>/dev/null)
         if [ -n "$HA_VERSION" ]; then
             echo -e "  ${GREEN}✔${NC}  Version: ${WHITE}${HA_VERSION}${NC}"
             log "HA version: $HA_VERSION"
@@ -474,6 +510,7 @@ main() {
     step_ubuntu
     step_ubuntu_deps
     step_homeassistant
+    step_ha_config
     step_launchers
     step_verify
     show_completion
