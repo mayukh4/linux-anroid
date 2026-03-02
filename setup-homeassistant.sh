@@ -332,7 +332,7 @@ step_ha_config() {
     if proot-distro login ubuntu -- grep -q "server_host" "${HASS_CONFIG}/configuration.yaml" 2>/dev/null; then
         printf "  ${GRAY}~${NC}  %-55s ${GRAY}(already configured)${NC}\n" "Network binding (0.0.0.0)"
     else
-        proot-distro login ubuntu -- sh -c "printf 'homeassistant:\nhttp:\n  server_host: 0.0.0.0\n' > ${HASS_CONFIG}/configuration.yaml"
+        proot-distro login ubuntu -- sh -c "printf 'homeassistant:\n\nhttp:\n  server_host: 0.0.0.0\n\nmobile_app:\n\ndefault_config:\n' > ${HASS_CONFIG}/configuration.yaml"
         echo -e "  ${GREEN}✔${NC}  Configured HA to accept connections from your network."
     fi
 }
