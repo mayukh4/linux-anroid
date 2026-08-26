@@ -28,6 +28,7 @@ TERMUX_HOME="${HOME:-/data/data/com.termux/files/home}"
 # ============== CONFIGURATION ==============
 INSTALL_WINE="no"
 DE_CHOICE="1"
+GPU_STACK="stock"
 DE_NAME="XFCE4"
 CURRENT_STEP=0
 # TOTAL_STEPS is set after user choices are made
@@ -97,55 +98,193 @@ spinner() {
     return "$exit_code"
 }
 
+# Same as spinner, but a failure is reported as a warning rather than an error.
+# For packages the desktop still works without.
+spinner_optional() {
+    local pid=$1
+    local message=$2
+    local spin=('⠋' '⠙' '⠸' '⠴' '⠦' '⠇')
+    local i=0
+
+    while kill -0 "$pid" 2>/dev/null; do
+        printf "\r  ${CYAN}${spin[$i]}${NC}  %s  " "$message"
+        i=$(( (i + 1) % 6 ))
+        sleep 0.1
+    done
+
+    wait "$pid"
+    local exit_code=$?
+
+    if [ "$exit_code" -eq 0 ]; then
+        printf "\r  ${GREEN}✔${NC}  %-55s\n" "$message"
+        log "OK: $message"
+    else
+        printf "\r  ${YELLOW}⚠${NC}  %-55s ${YELLOW}(optional — skipped)${NC}\n" "$message"
+        log "OPTIONAL FAILED: $message"
+    fi
+
+    return 0
+}
+
+# ============== DPKG / APT HELPERS ==============
+
+# dpkg -s also succeeds for packages that were removed but left their config
+# behind, so ask for the real status instead.
+pkg_installed() {
+    [ "$(dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null)" = "installed" ]
+}
+
+pkg_version() {
+    dpkg-query -W -f='${Version}' "$1" 2>/dev/null
+}
+
+# apt-cache show prints one stanza per available version, highest first.
+# We only care about the candidate, so cut at the first blank line.
+apt_field() {
+    apt-cache show "$1" 2>/dev/null \
+        | sed -n '1,/^$/p' \
+        | grep -i "^$2:" \
+        | head -1 \
+        | sed "s/^[^:]*:[[:space:]]*//"
+}
+
+# Strip version constraints and whitespace from a dependency list, one per line.
+# "libmesa, ndk-sysroot (<< 23b-6), mesa" → "libmesa\nndk-sysroot\nmesa"
+dep_names() {
+    echo "$1" | tr ',' '\n' | sed 's/(.*//' | tr -d ' \t' | grep -v '^$'
+}
+
+# Is a single Conflicts entry actually violated right now?
+#
+# This is the bit the old version got wrong. Termux's mesa-zink declares
+#   Conflicts: libmesa, ndk-sysroot (<< 23b-6), mesa
+# Treating "ndk-sysroot (<< 23b-6)" as a plain name means any modern
+# ndk-sysroot looks like a conflict and mesa-zink gets skipped, even though the
+# constraint only covers versions older than 23b-6. (issue #4)
+conflict_is_real() {
+    local item="$1"
+    local cname cop cver iver
+
+    cname=$(echo "$item" | sed 's/(.*//' | tr -d ' \t')
+    [ -z "$cname" ] && return 1
+    pkg_installed "$cname" || return 1
+
+    # No version constraint → any installed version conflicts.
+    case "$item" in
+        *"("*")"*) ;;
+        *) return 0 ;;
+    esac
+
+    cop=$(echo "$item"  | sed -n 's/.*(\([<>=]\{1,2\}\)[[:space:]]*[^)]*).*/\1/p')
+    cver=$(echo "$item" | sed -n 's/.*([<>=]\{1,2\}[[:space:]]*\([^)]*\)).*/\1/p')
+    iver=$(pkg_version "$cname")
+    if [ -z "$cop" ] || [ -z "$cver" ] || [ -z "$iver" ]; then
+        return 0
+    fi
+
+    case "$cop" in
+        "<<") cop="lt" ;;
+        "<="|"<") cop="le" ;;
+        "=")      cop="eq" ;;
+        ">="|">") cop="ge" ;;
+        ">>")     cop="gt" ;;
+        *) return 0 ;;
+    esac
+
+    dpkg --compare-versions "$iver" "$cop" "$cver"
+}
+
+# Name of an installed package that already Provides "$1", if any.
+provider_of() {
+    dpkg-query -W -f='${db:Status-Status}|${Package}|${Provides}\n' 2>/dev/null \
+        | awk -F'|' -v want="$1" '
+            $1 == "installed" {
+                n = split($3, a, ",")
+                for (i = 1; i <= n; i++) {
+                    p = a[i]; sub(/\(.*/, "", p); gsub(/[ \t]/, "", p)
+                    if (p == want) { print $2; exit }
+                }
+            }'
+}
+
 # ============== CONFLICT-SAFE PACKAGE INSTALLER ==============
 #
 # Why this exists:
 #   Termux has packages that hard-conflict with each other
 #   (e.g. vulkan-loader-android vs vulkan-loader-generic).
 #   Raw apt-get errors out on conflicts and — combined with set -e — would
-#   silently kill the entire script. Metapackages like vulkan-icd make this
-#   worse by pulling in conflicting deps indirectly.
+#   silently kill the entire script.
 #
 # What this does:
-#   1. Skips if the package is already installed.
-#   2. Reads the package's declared Conflicts from apt-cache before installing.
-#   3. If a conflicting package is already present, skips safely with a warning.
-#   4. Otherwise installs normally.
+#   1. Skips if the package is already installed, or already provided by
+#      something installed (vulkan-loader-generic Provides vulkan-loader-android).
+#   2. Reads the package's declared Conflicts and evaluates each one properly,
+#      version constraints included.
+#   3. Ignores a conflict the package also Replaces/Provides — that is a
+#      supported swap (mesa → mesa-zink), not a breakage, and apt handles it.
+#   4. Only then skips, with a warning, on a conflict that is genuinely unsafe.
+#
+# Usage: safe_install_pkg <pkg> [display name] [optional]
+#   Passing "optional" as the third argument downgrades a failed install from a
+#   red error to a yellow warning, for packages the desktop can live without.
 #
 safe_install_pkg() {
     local pkg=$1
     local name=${2:-$pkg}
+    local optional=${3:-}
 
-    # Skip if already installed
-    if dpkg -s "$pkg" &>/dev/null; then
+    if pkg_installed "$pkg"; then
         printf "  ${GRAY}~${NC}  %-55s ${GRAY}(already installed)${NC}\n" "$name"
         log "SKIP (already installed): $pkg"
         return 0
     fi
 
-    # Read declared Conflicts from apt-cache and check each one
-    local conflicts
-    conflicts=$(apt-cache show "$pkg" 2>/dev/null \
-        | grep -i "^Conflicts:" \
-        | sed 's/^Conflicts://i' \
-        | tr ',' '\n' \
-        | awk '{print $1}')
+    # Already satisfied by a virtual provider?
+    local provider
+    provider=$(provider_of "$pkg")
+    if [ -n "$provider" ]; then
+        printf "  ${GRAY}~${NC}  %-55s ${GRAY}(provided by %s)${NC}\n" "$name" "$provider"
+        log "SKIP (provided by $provider): $pkg"
+        return 0
+    fi
 
-    for conflict in $conflicts; do
-        [ -z "$conflict" ] && continue
-        if dpkg -s "$conflict" &>/dev/null; then
-            printf "  ${YELLOW}⚠${NC}  %-55s ${YELLOW}(skipped — conflicts with: %s)${NC}\n" \
-                "$name" "$conflict"
-            log "SKIP (conflict with $conflict): $pkg"
-            return 0
+    if ! apt-cache show "$pkg" >/dev/null 2>&1; then
+        printf "  ${YELLOW}⚠${NC}  %-55s ${YELLOW}(not in any enabled repo)${NC}\n" "$name"
+        log "SKIP (unavailable): $pkg"
+        return 1
+    fi
+
+    # Conflicts the package can legitimately take over are not blockers.
+    local swappable
+    swappable=$(dep_names "$(apt_field "$pkg" Replaces)
+$(apt_field "$pkg" Provides)")
+
+    local item cname
+    while IFS= read -r item; do
+        [ -z "$(echo "$item" | tr -d ' \t')" ] && continue
+
+        if conflict_is_real "$item"; then
+            cname=$(echo "$item" | sed 's/(.*//' | tr -d ' \t')
+            if echo "$swappable" | grep -qx "$cname"; then
+                log "CONFLICT OK (${pkg} replaces ${cname}): apt will swap them"
+            else
+                printf "  ${YELLOW}⚠${NC}  %-55s ${YELLOW}(skipped — conflicts with: %s)${NC}\n" \
+                    "$name" "$cname"
+                log "SKIP (conflict with $cname): $pkg"
+                return 1
+            fi
         fi
-    done
+    done <<< "$(apt_field "$pkg" Conflicts | tr ',' '\n')"
 
-    # Safe to install
     (DEBIAN_FRONTEND=noninteractive apt-get install -y \
         -o Dpkg::Options::="--force-confold" \
         "$pkg" >> "$LOG_FILE" 2>&1) &
-    spinner $! "Installing ${name}..."
+
+    if [ "$optional" = "optional" ]; then
+        spinner_optional $! "Installing ${name}..."
+    else
+        spinner $! "Installing ${name}..."
+    fi
 }
 
 # ============== BANNER ==============
@@ -310,6 +449,11 @@ step_desktop() {
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Installing ${DE_NAME} Desktop...${NC}"
     echo ""
 
+    # None of the Termux DE metapackages depend on dbus, but every one of them
+    # needs a session bus to reach its settings daemon. Without it XFCE greets
+    # you with "Unable to contact settings server". (issue #5)
+    safe_install_pkg "dbus" "D-Bus (session message bus)"
+
     case $DE_CHOICE in
         1)
             safe_install_pkg "xfce4"                    "XFCE4 Desktop"
@@ -340,27 +484,74 @@ step_desktop() {
 }
 
 # ============== STEP 5: GPU DRIVERS ==============
+#
+# Termux's own "mesa" package has shipped the Zink Gallium driver
+# (lib/dri/zink_dri.so) since Mesa 23, so GALLIUM_DRIVER=zink works against the
+# stock, current Mesa. The TUR "mesa-zink" package is Mesa 22.0.5 from 2022:
+# installing it REMOVES mesa and drops you back four years, and its companion
+# mesa-zink-vulkan-icd-freedreno ships the same libvulkan_freedreno.so as the
+# main-repo Turnip driver, so dpkg aborts with a file-overwrite error if both
+# land on the device. That was issue #4.
+#
+# So: prefer the stock stack, and only use the TUR one on installs whose Mesa
+# genuinely has no Zink, or that already have mesa-zink from an earlier run.
 step_gpu() {
     update_progress
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Installing GPU acceleration...${NC}"
     echo ""
 
-    safe_install_pkg "mesa-zink" "Mesa Zink (OpenGL on Vulkan)"
+    GPU_STACK="stock"
 
-    # vulkan-loader-android and vulkan-loader-generic hard-conflict with each other.
-    # safe_install_pkg automatically reads the Conflicts field from apt-cache and
-    # skips whichever one would break — no manual dpkg checks needed.
-    # Do NOT use the vulkan-icd metapackage — it depends on vulkan-loader-android
-    # and will trigger the same conflict indirectly.
-    safe_install_pkg "vulkan-loader-android" "Vulkan Loader"
-
-    if [ "$GPU_DRIVER" == "freedreno" ]; then
-        safe_install_pkg "mesa-vulkan-icd-freedreno"      "Freedreno Vulkan ICD (Turnip)"
-        safe_install_pkg "mesa-zink-vulkan-icd-freedreno" "Mesa Zink Freedreno ICD"
+    if pkg_installed "mesa-zink"; then
+        # Don't rip out a working legacy setup on re-run — the two stacks
+        # overwrite each other's files.
+        GPU_STACK="tur"
+        printf "  ${GRAY}~${NC}  %-55s ${GRAY}(keeping TUR stack)${NC}\n" "Existing mesa-zink install detected"
+        log "GPU stack: tur (mesa-zink already installed)"
     else
-        safe_install_pkg "mesa-vulkan-icd-swrast"         "SwRast Vulkan ICD (software)"
-        safe_install_pkg "mesa-zink-vulkan-icd-swrast"    "Mesa Zink SwRast ICD"
+        safe_install_pkg "mesa" "Mesa (OpenGL + Zink)"
+        if [ ! -f "${TERMUX_PREFIX}/lib/dri/zink_dri.so" ]; then
+            GPU_STACK="tur"
+            echo -e "  ${YELLOW}⚠${NC}  This Mesa build has no Zink — falling back to TUR mesa-zink."
+            log "GPU stack: tur (no zink_dri.so in stock mesa)"
+        else
+            log "GPU stack: stock (zink_dri.so present)"
+        fi
     fi
+
+    # vulkan-loader-generic is the modern loader and is what every
+    # mesa-vulkan-icd-* depends on. Do NOT ask for vulkan-loader-android:
+    # vulkan-loader-generic both Provides AND Conflicts with it, so requesting
+    # it on a normal install aborts the apt transaction for zero benefit.
+    safe_install_pkg "vulkan-loader-generic" "Vulkan Loader"
+
+    if [ "$GPU_STACK" == "tur" ]; then
+        safe_install_pkg "mesa-zink" "Mesa Zink (OpenGL on Vulkan)"
+        if [ "$GPU_DRIVER" == "freedreno" ]; then
+            safe_install_pkg "mesa-zink-vulkan-icd-freedreno" "Freedreno Vulkan ICD (Turnip)"
+        else
+            safe_install_pkg "mesa-zink-vulkan-icd-swrast"    "SwRast Vulkan ICD (software)"
+        fi
+    else
+        if [ "$GPU_DRIVER" == "freedreno" ]; then
+            safe_install_pkg "mesa-vulkan-icd-freedreno" "Freedreno Vulkan ICD (Turnip)"
+        else
+            safe_install_pkg "mesa-vulkan-icd-swrast"    "SwRast Vulkan ICD (software)"
+        fi
+    fi
+
+    # Verify here rather than letting a missing ICD show up as a black screen
+    # ten minutes from now.
+    echo ""
+    if [ "$GPU_DRIVER" == "freedreno" ]; then
+        if [ -f "${TERMUX_PREFIX}/share/vulkan/icd.d/freedreno_icd.aarch64.json" ]; then
+            echo -e "  ${GREEN}✔${NC}  Turnip (Adreno) Vulkan driver in place."
+        else
+            echo -e "  ${YELLOW}⚠${NC}  Turnip ICD missing — the desktop will fall back to software rendering."
+            log "WARNING: freedreno ICD json not found"
+        fi
+    fi
+    log "GPU stack final: $GPU_STACK"
 }
 
 # ============== STEP 6: AUDIO ==============
@@ -425,19 +616,19 @@ step_launchers() {
 
     mkdir -p ~/.config
 
-    XDG_INJECT="export XDG_DATA_DIRS=${TERMUX_PREFIX}/share:\${XDG_DATA_DIRS:-}\nexport XDG_CONFIG_DIRS=${TERMUX_PREFIX}/etc/xdg:\${XDG_CONFIG_DIRS:-}"
+    XDG_INJECT="export XDG_DATA_DIRS=${TERMUX_PREFIX}/share:\${XDG_DATA_DIRS:-}\nexport XDG_CONFIG_DIRS=${TERMUX_PREFIX}/etc/xdg:\${XDG_CONFIG_DIRS:-}\nexport XDG_RUNTIME_DIR=\${TMPDIR:-${TERMUX_PREFIX}/tmp}"
 
     if [ "$DE_CHOICE" == "4" ]; then
         mkdir -p ~/.config/plasma-workspace/env
         {
-            echo "#!/${TERMUX_PREFIX}/bin/bash"
+            echo "#!${TERMUX_PREFIX}/bin/bash"
             echo -e "$XDG_INJECT"
         } > ~/.config/plasma-workspace/env/xdg_fix.sh
         chmod +x ~/.config/plasma-workspace/env/xdg_fix.sh
     fi
 
     cat > ~/.config/linux-gpu.sh << EOF
-#!/${TERMUX_PREFIX}/bin/bash
+#!${TERMUX_PREFIX}/bin/bash
 # GPU & Mesa environment — sourced by start-linux.sh
 export MESA_NO_ERROR=1
 export MESA_GL_VERSION_OVERRIDE=4.6
@@ -478,24 +669,24 @@ PLANKEOF
     case $DE_CHOICE in
         1)
             EXEC_CMD="exec startxfce4"
-            KILL_CMD="pkill -9 xfce4-session; pkill -9 plank"
+            KILL_CMD="pkill -9 xfce4-session 2>/dev/null; pkill -9 plank 2>/dev/null"
             ;;
         2)
             EXEC_CMD="exec startlxqt"
-            KILL_CMD="pkill -9 lxqt-session"
+            KILL_CMD="pkill -9 lxqt-session 2>/dev/null"
             ;;
         3)
             EXEC_CMD="exec mate-session"
-            KILL_CMD="pkill -9 mate-session; pkill -9 plank"
+            KILL_CMD="pkill -9 mate-session 2>/dev/null; pkill -9 plank 2>/dev/null"
             ;;
         4)
             EXEC_CMD="(sleep 5 && pkill -9 plasmashell && plasmashell) >/dev/null 2>&1 &\nexec startplasma-x11"
-            KILL_CMD="pkill -9 startplasma-x11; pkill -9 kwin_x11"
+            KILL_CMD="pkill -9 startplasma-x11 2>/dev/null; pkill -9 kwin_x11 2>/dev/null"
             ;;
     esac
 
     cat > ~/start-linux.sh << LAUNCHEREOF
-#!/${TERMUX_PREFIX}/bin/bash
+#!${TERMUX_PREFIX}/bin/bash
 echo ""
 echo "[*] Starting ${DE_NAME} on Termux-X11..."
 echo ""
@@ -504,9 +695,37 @@ source ~/.config/linux-gpu.sh 2>/dev/null
 
 echo "[*] Cleaning up old sessions..."
 pkill -9 -f "termux.x11" 2>/dev/null || true
-${KILL_CMD} 2>/dev/null || true
+${KILL_CMD} || true
 pkill -9 -f "dbus-daemon" 2>/dev/null || true
 sleep 0.5
+
+# ---- D-Bus session bus ----
+# XFCE, MATE and KDE all reach their settings daemon over the session bus.
+# If no bus is running -- or if a previous run was SIGKILLed and left a dead
+# socket plus a stale address in ~/.dbus behind -- the desktop comes up with
+# "Unable to contact settings server" and
+# "Failed to connect to socket .../dbus-XXXX: Connection refused".
+# Clearing the stale state and starting the bus at a fixed, predictable
+# address fixes both. (issue #5)
+echo "[*] Starting D-Bus session bus..."
+export XDG_RUNTIME_DIR="\${TMPDIR:-${TERMUX_PREFIX}/tmp}"
+mkdir -p "\$XDG_RUNTIME_DIR" 2>/dev/null || true
+chmod 700 "\$XDG_RUNTIME_DIR" 2>/dev/null || true
+
+DBUS_DIR="${TERMUX_PREFIX}/var/run/dbus"
+rm -rf "\$HOME/.dbus" 2>/dev/null || true
+rm -f "${TERMUX_PREFIX}/tmp/dbus-"* 2>/dev/null || true
+mkdir -p "\$DBUS_DIR" "${TERMUX_PREFIX}/var/lib/dbus"
+rm -f "\$DBUS_DIR/session_bus_socket"
+dbus-uuidgen --ensure >/dev/null 2>&1 || true
+
+export DBUS_SESSION_BUS_ADDRESS="unix:path=\$DBUS_DIR/session_bus_socket"
+if command -v dbus-daemon >/dev/null 2>&1; then
+    dbus-daemon --session --address="\$DBUS_SESSION_BUS_ADDRESS" --nopidfile --fork
+else
+    echo "[!] dbus-daemon not found. Run: pkg install dbus"
+    unset DBUS_SESSION_BUS_ADDRESS
+fi
 
 echo "[*] Starting PulseAudio..."
 unset PULSE_SERVER
@@ -522,6 +741,10 @@ termux-x11 :0 -ac &
 sleep 3
 export DISPLAY=:0
 
+# Daemons the bus starts on demand (xfconfd, xfsettingsd, ...) inherit the
+# bus's environment, not this shell's -- so push DISPLAY across explicitly.
+dbus-update-activation-environment DISPLAY XAUTHORITY PULSE_SERVER XDG_DATA_DIRS XDG_CONFIG_DIRS XDG_RUNTIME_DIR >/dev/null 2>&1 || true
+
 echo ""
 echo "─────────────────────────────────────────────────"
 echo "  ✔ Desktop launching! Open the Termux-X11 app."
@@ -534,12 +757,15 @@ LAUNCHEREOF
     echo -e "  ${GREEN}✔ Created ~/start-linux.sh${NC}"
 
     cat > ~/stop-linux.sh << STOPEOF
-#!/${TERMUX_PREFIX}/bin/bash
+#!${TERMUX_PREFIX}/bin/bash
 echo "[*] Stopping ${DE_NAME}..."
 pkill -9 -f "termux.x11" 2>/dev/null || true
 pkill -9 -f "pulseaudio"  2>/dev/null || true
-${KILL_CMD} 2>/dev/null || true
+${KILL_CMD} || true
 pkill -9 -f "dbus-daemon" 2>/dev/null || true
+# Leave no dead socket for the next start to trip over.
+rm -f "${TERMUX_PREFIX}/var/run/dbus/session_bus_socket" 2>/dev/null || true
+rm -rf "\$HOME/.dbus" 2>/dev/null || true
 echo "[✔] Desktop stopped."
 STOPEOF
     chmod +x ~/stop-linux.sh
