@@ -1,5 +1,11 @@
 # Repurpose Your Old Android Phone
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Platform: Android](https://img.shields.io/badge/platform-Android%207%2B-3ddc84.svg)](https://termux.dev)
+[![Termux](https://img.shields.io/badge/Termux-F--Droid-000000.svg)](https://f-droid.org/en/packages/com.termux/)
+[![Stars](https://img.shields.io/github/stars/mayukh4/linux-android?style=flat)](https://github.com/mayukh4/linux-android/stargazers)
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2.svg)](https://github.com/sponsors/mayukh4)
+
 **[中文文档](README.zh.md)**
 
 Turn any old Android phone into a **Linux desktop** or a **smart home server** — no PC, no root, no cloud. Just [Termux](https://termux.dev).
@@ -83,7 +89,7 @@ The `termux-wake-lock` command keeps Termux alive when your screen turns off —
 ### Step 3 — Download and run the script
 
 ```bash
-curl -O https://raw.githubusercontent.com/mayukh4/linux-anroid/main/termux-linux-setup.sh
+curl -O https://raw.githubusercontent.com/mayukh4/linux-android/main/termux-linux-setup.sh
 chmod +x termux-linux-setup.sh
 bash termux-linux-setup.sh
 ```
@@ -116,6 +122,7 @@ bash ~/stop-linux.sh
 | **Desktop Environment** | Your choice: XFCE4, LXQt, MATE, or KDE |
 | **Mesa / Zink** | OpenGL via Vulkan — enables GPU-accelerated graphics |
 | **Turnip driver** | Qualcomm Adreno open-source Vulkan driver (if detected) |
+| **D-Bus** | Session message bus — required by every desktop's settings daemon |
 | **PulseAudio** | Audio server |
 | **Firefox** | Full desktop web browser |
 | **VLC** | Video and audio player |
@@ -134,7 +141,19 @@ The script detects your GPU automatically using hardware properties (not brand n
 
 **Mali / Other GPUs:** Falls back to **Zink + SwRast** (software Vulkan). Functional but lighter desktops (XFCE4, LXQt) are strongly recommended.
 
+Zink comes from Termux's own `mesa` package (`$PREFIX/lib/dri/zink_dri.so`), which has shipped it since Mesa 23. The script only falls back to the third-party `mesa-zink` build on installs whose Mesa genuinely lacks Zink, or that already have `mesa-zink` from an earlier run — the two stacks ship the same library filenames and cannot be mixed.
+
 The GPU environment is saved in `~/.config/linux-gpu.sh` and loaded automatically on every `start-linux.sh`. You can edit that file to tweak Mesa flags.
+
+Check what the desktop is actually using, from a terminal inside the desktop:
+
+```bash
+# Which Vulkan driver did the loader pick?
+vulkaninfo --summary | head -30
+
+# Which OpenGL renderer is in use? Should say "zink"
+glxinfo -B | grep -i "renderer\|opengl version"
+```
 
 ---
 
@@ -251,7 +270,7 @@ Home Assistant Core runs inside a lightweight Ubuntu container (via proot-distro
 ### Installation
 
 ```bash
-curl -O https://raw.githubusercontent.com/mayukh4/linux-anroid/main/setup-homeassistant.sh
+curl -O https://raw.githubusercontent.com/mayukh4/linux-android/main/setup-homeassistant.sh
 bash setup-homeassistant.sh
 ```
 
@@ -265,7 +284,76 @@ bash ~/start-homeassistant.sh
 
 # Stop Home Assistant
 bash ~/stop-homeassistant.sh
+
+# Upgrade to the newest version your container's Python supports
+bash ~/upgrade-homeassistant.sh
 ```
+
+### HACS — the community add-on store
+
+[HACS](https://www.hacs.xyz) is the community store for integrations, themes, and Lovelace cards that aren't in HA core. The setup script offers to install it for you.
+
+> **Install HACS before any other custom integration.** If `custom_components/` already contains hand-installed integrations, remove them first — otherwise HACS can end up in a broken state.
+
+To install it by hand after the fact:
+
+```bash
+proot-distro login ubuntu -- sh -c "cd ~/hass-config && wget -O - https://get.hacs.xyz | bash -"
+```
+
+Then restart Home Assistant and finish setup in the dashboard:
+
+1. **Settings → Devices & Services → + Add Integration**
+2. Search for **HACS**
+3. Tick all the acknowledgements, then authorize with your GitHub account
+
+Full configuration docs: [hacs.xyz/docs/use/configuration/basic](https://www.hacs.xyz/docs/use/configuration/basic/).
+
+### Upgrading Home Assistant
+
+```bash
+bash ~/upgrade-homeassistant.sh
+```
+
+**Why a fresh install may land on an older version than the HA website shows.** `pip` installs the newest release whose `requires-python` your interpreter satisfies, then stops. It is not a failed install:
+
+| Container Python | Newest Home Assistant you can run |
+|---|---|
+| 3.12 | 2025.1.x |
+| 3.13.0 – 3.13.1 | 2025.5.x |
+| 3.13.2+ | **2026.2.x** |
+| 3.14.2+ | 2026.3 and later |
+
+(Verified against each release's `requires-python` on PyPI.)
+
+`proot-distro install ubuntu` tracks a rolling Ubuntu release, so which Python you get depends on when you installed the container. `bash ~/upgrade-homeassistant.sh` prints your Python version and tells you if you have hit the ceiling.
+
+<details>
+<summary>Advanced: get past the ceiling with a newer Python</summary>
+
+This is not automated because it replaces the interpreter under a working install. Back up `~/hass-config` first.
+
+```bash
+proot-distro login ubuntu
+
+# 1. Fetch a standalone CPython 3.14 (no PPA, no compiling)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+uv python install 3.14
+
+# 2. Build a fresh venv on it, leaving the old one in place
+uv venv --python 3.14 ~/hass-venv-314
+~/hass-venv-314/bin/python -m pip install --upgrade pip wheel setuptools
+uv pip install --python ~/hass-venv-314/bin/python homeassistant
+
+# 3. Test it against your existing config before switching over
+~/hass-venv-314/bin/hass -c ~/hass-config
+```
+
+If it starts cleanly, point `~/start-homeassistant.sh` at `hass-venv-314/bin/hass`. If not, your old `~/hass-venv` is untouched — just keep using it.
+
+Note that Home Assistant Core (the Python/venv install method) was [deprecated upstream in 2025](https://www.home-assistant.io/blog/2025/05/22/deprecating-core-and-supervised-installation-methods-and-32-bit-systems/). It still works and still gets releases; it just is not an officially supported install method any more. On a phone it remains the only realistic option — HA OS and HA Container both need Docker or bare metal.
+</details>
 
 ### Accessing the dashboard
 
@@ -343,8 +431,28 @@ Run `stop-linux.sh` then `start-linux.sh` again. KDE Plasma can take 20–30 sec
 **"library not found" or "cannot link executable" error during install**
 This is the libpcre crash. Close Termux completely, reopen it, run `pkg upgrade -y`, then re-run the script.
 
+**"Unable to contact settings server" / "Failed to connect to socket .../dbus-XXXX: Connection refused"**
+The desktop's settings daemon talks over the D-Bus session bus. Either no bus is running, or a previous session was force-killed and left a dead socket behind that the desktop keeps trying to reuse. `start-linux.sh` now clears the stale state and starts a bus at a fixed address before launching the desktop. If you are on an older copy of the script, re-run `termux-linux-setup.sh` to regenerate the launchers, or fix it by hand:
+
+```bash
+pkg install dbus
+pkill -9 -f dbus-daemon
+rm -rf ~/.dbus "$PREFIX"/tmp/dbus-*
+mkdir -p "$PREFIX/var/run/dbus"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$PREFIX/var/run/dbus/session_bus_socket"
+dbus-daemon --session --address="$DBUS_SESSION_BUS_ADDRESS" --nopidfile --fork
+```
+
+**Vulkan / Mesa packages fail: "vulkan-loader-generic : Conflicts: vulkan-loader-android", or dpkg "trying to overwrite libvulkan_freedreno.so"**
+Two separate causes, both fixed in the current script:
+
+- `vulkan-loader-generic` both *provides* and *conflicts with* `vulkan-loader-android`, so asking for the android loader on a normal install aborts the whole transaction for no benefit. The script now installs `vulkan-loader-generic`.
+- The third-party `mesa-zink-vulkan-icd-freedreno` (Mesa 22) ships the same `libvulkan_freedreno.so` as the main-repo Turnip driver (Mesa 26), so installing both makes dpkg abort. The script now picks one stack and stays on it.
+
+If your install predates this fix, GPU acceleration probably still worked — those two failures are loud but not fatal. Re-running the script cleans it up.
+
 **Package install fails with "unmet dependencies" or "Conflicts"**
-The script's `safe_install_pkg` function automatically reads conflict declarations from apt and skips packages that would break your system. If you still see this, check the log and open a GitHub issue with your device model and Android version.
+The script's `safe_install_pkg` function reads each package's declared conflicts, evaluates version constraints properly, and lets apt perform conflicts the package legitimately replaces. If you still see this, check the log and open a GitHub issue with your device model and Android version.
 
 **Audio not working**
 Wait 5–10 seconds after the desktop appears. PulseAudio needs a moment to initialize on first start.
