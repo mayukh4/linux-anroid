@@ -4,9 +4,6 @@
 [![Platform: Android](https://img.shields.io/badge/platform-Android%207%2B-3ddc84.svg)](https://termux.dev)
 [![Termux](https://img.shields.io/badge/Termux-F--Droid-000000.svg)](https://f-droid.org/en/packages/com.termux/)
 [![Stars](https://img.shields.io/github/stars/mayukh4/linux-android?style=flat)](https://github.com/mayukh4/linux-android/stargazers)
-[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2.svg)](https://github.com/sponsors/mayukh4)
-
-**[中文文档](README.zh.md)**
 
 Turn any old Android phone into a **Linux desktop** or a **smart home server** — no PC, no root, no cloud. Just [Termux](https://termux.dev).
 
@@ -32,9 +29,11 @@ graph LR
 
 You can run both on the same phone — they don't conflict.
 
-You can follow along the YouTube video here: https://youtu.be/tYm2rQpkOcg?si=moV59vk5J7B4h46N
+### Watch the full build
 
-<img width="1600" height="900" alt="mayukh_builds (3)" src="https://github.com/user-attachments/assets/bb2efabe-ffff-4098-ba58-45d1e68a6aaf" />
+[![Watch the video walkthrough](https://github.com/user-attachments/assets/bb2efabe-ffff-4098-ba58-45d1e68a6aaf)](https://youtu.be/tYm2rQpkOcg)
+
+**▶ [Repurpose Your Old Android Phone — full walkthrough](https://youtu.be/tYm2rQpkOcg)** — every step in this README, on video, with timestamps in the description.
 
 ---
 
@@ -528,9 +527,16 @@ Add to `~/.bashrc` in Termux:
 <details>
 <summary>How the conflict-safe installer works</summary>
 
-Termux has several packages that hard-conflict with each other (for example `vulkan-loader-android` and `vulkan-loader-generic` declare a mutual `Conflicts`). Standard `apt-get` will fail loudly when you try to install one while the other is present, causing the script to exit.
+Termux has several packages that hard-conflict with each other (for example `vulkan-loader-android` and `vulkan-loader-generic` declare a mutual `Conflicts`). Standard `apt-get` fails loudly when you install one while the other is present, which would exit the script mid-run.
 
-The `safe_install_pkg` function solves this by reading the `Conflicts` field from `apt-cache show` before every install attempt. If any declared conflict is already installed on the system, the package is skipped with a warning and the script continues. This means the script is safe to run on any Termux setup regardless of what packages were pre-installed.
+`safe_install_pkg` reads each package's metadata from `apt-cache show` before installing and decides what to do:
+
+1. **Already installed, or already provided.** `vulkan-loader-generic` *provides* `vulkan-loader-android`, so asking for the latter is already satisfied — no install needed.
+2. **Version constraints are honoured.** `Conflicts: ndk-sysroot (<< 23b-6)` only applies below `23b-6`, evaluated with `dpkg --compare-versions`. Treating that as an unconditional conflict used to skip packages that would have installed fine.
+3. **Replacements are allowed through.** A package that declares `Replaces:`/`Provides:` the thing it conflicts with is a supported swap, and apt handles it.
+4. **Genuine conflicts are skipped** with a warning, and the script continues.
+
+The result: the script is safe to run on any Termux setup regardless of what was pre-installed, without silently skipping things it should have installed.
 </details>
 
 <details>
@@ -544,6 +550,20 @@ All hardcoded `/data/data/com.termux/...` paths have been replaced with `$PREFIX
 ## Contributing
 
 PRs and issues are welcome. If a package name has changed, a DE has a better startup command, or you've found a new conflict to handle, open an issue with your device model and Android version.
+
+---
+
+## Read this in other languages
+
+If you would prefer to read this in Chinese, the full translation is here: **[中文文档 / Chinese documentation](README.zh.md)**.
+
+Translations of the README into other languages are welcome — open a PR with a `README.<lang>.md` file and I will link it here.
+
+---
+
+## Support this project
+
+If this saved you buying a Raspberry Pi, you can [sponsor the work on GitHub](https://github.com/sponsors/mayukh4). Starring the repo helps too — it is what gets it in front of the next person looking to do this.
 
 ---
 

@@ -28,9 +28,11 @@ graph LR
 
 两者可以在同一部手机上运行 — 互不冲突。
 
-YouTube 视频教程：https://youtu.be/tYm2rQpkOcg?si=moV59vk5J7B4h46N
+### 观看完整教程
 
-<img width="1600" height="900" alt="mayukh_builds (3)" src="https://github.com/user-attachments/assets/bb2efabe-ffff-4098-ba58-45d1e68a6aaf" />
+[![观看视频教程](https://github.com/user-attachments/assets/bb2efabe-ffff-4098-ba58-45d1e68a6aaf)](https://youtu.be/tYm2rQpkOcg)
+
+**▶ [旧安卓手机再利用 — 完整视频教程](https://youtu.be/tYm2rQpkOcg)** — 本文档的每一步都有视频演示，视频描述中附有时间戳。
 
 ---
 
@@ -502,6 +504,18 @@ Termux 中有几个包会互相硬冲突（例如 `vulkan-loader-android` 和 `v
 ## 贡献
 
 欢迎提交 PR 和 Issue。如果包名已更改、某个桌面环境有更好的启动命令，或者你发现了新的冲突需要处理，请提交 Issue 并附上设备型号和安卓版本。
+
+---
+
+## 其他语言
+
+英文原版文档在这里：**[English documentation](README.md)**（内容以英文版为准）。
+
+---
+
+## 支持本项目
+
+如果本项目帮你省下了买树莓派的钱，欢迎[在 GitHub 上赞助](https://github.com/sponsors/mayukh4)。给仓库点个 Star 也很有帮助 — 这能让更多有同样需求的人看到它。
 
 ---
 
