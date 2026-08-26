@@ -2,6 +2,8 @@
 
 **[English](README.md)**
 
+> 本翻译可能落后于英文 README。以 [README.md](README.md) 为准。
+
 将任意旧安卓手机变成 **Linux 桌面**或**智能家居服务器** — 无需电脑、无需 Root、无需云服务，只需 [Termux](https://termux.dev)。
 
 > 本项目配合 YouTube 视频教程制作，视频描述中附有时间戳索引。
@@ -83,7 +85,7 @@ pkg upgrade -y
 ### 步骤 3 — 下载并运行脚本
 
 ```bash
-curl -O https://raw.githubusercontent.com/mayukh4/linux-anroid/main/termux-linux-setup.sh
+curl -O https://raw.githubusercontent.com/mayukh4/linux-android/main/termux-linux-setup.sh
 chmod +x termux-linux-setup.sh
 bash termux-linux-setup.sh
 ```
@@ -251,7 +253,7 @@ Home Assistant Core 运行在手机上的轻量级 Ubuntu 容器中（通过 pro
 ### 安装
 
 ```bash
-curl -O https://raw.githubusercontent.com/mayukh4/linux-anroid/main/setup-homeassistant.sh
+curl -O https://raw.githubusercontent.com/mayukh4/linux-android/main/setup-homeassistant.sh
 bash setup-homeassistant.sh
 ```
 
@@ -265,7 +267,51 @@ bash ~/start-homeassistant.sh
 
 # 停止 Home Assistant
 bash ~/stop-homeassistant.sh
+
+# 升级到当前容器 Python 所能支持的最新版本
+bash ~/upgrade-homeassistant.sh
 ```
+
+### HACS — 社区插件商店
+
+[HACS](https://www.hacs.xyz) 是社区集成、主题和 Lovelace 卡片的商店，收录了 HA 核心之外的内容。安装脚本会询问是否为你安装。
+
+> **请在安装任何其他自定义集成之前先安装 HACS。** 如果 `custom_components/` 中已有手动安装的集成，请先删除它们，否则 HACS 可能会处于损坏状态。
+
+事后手动安装：
+
+```bash
+proot-distro login ubuntu -- sh -c "cd ~/hass-config && wget -O - https://get.hacs.xyz | bash -"
+```
+
+然后重启 Home Assistant，并在仪表盘中完成设置：
+
+1. **设置 → 设备与服务 → + 添加集成**
+2. 搜索 **HACS**
+3. 勾选所有确认项，然后使用 GitHub 账号授权
+
+完整配置文档：[hacs.xyz/docs/use/configuration/basic](https://www.hacs.xyz/docs/use/configuration/basic/)。
+
+### 升级 Home Assistant
+
+```bash
+bash ~/upgrade-homeassistant.sh
+```
+
+**为什么全新安装得到的版本比 HA 官网显示的旧。** `pip` 只会安装解释器所满足 `requires-python` 的最新版本，然后就停下来。这不是安装失败：
+
+| 容器 Python | 可运行的最新 Home Assistant |
+|---|---|
+| 3.12 | 2025.1.x |
+| 3.13.0 – 3.13.1 | 2025.5.x |
+| 3.13.2+ | **2026.2.x** |
+| 3.14.2+ | 2026.3 及以后 |
+
+（依据 PyPI 上各版本的 `requires-python` 核实。）
+
+`proot-distro install ubuntu` 跟随 Ubuntu 滚动发行版，所以你拿到哪个 Python 取决于安装容器的时间。`bash ~/upgrade-homeassistant.sh` 会打印你的 Python 版本，并在触及上限时告诉你。
+
+> 想突破这个上限（改用 Python 3.14）请参见[英文文档的 Upgrading Home Assistant 一节](README.md#upgrading-home-assistant)。该操作会替换正在运行的安装所用的解释器，因此没有自动化。
 
 ### 访问仪表盘
 
@@ -343,8 +389,28 @@ echo 'termux-wake-lock && nohup bash ~/start-homeassistant.sh > ~/hass.log 2>&1 
 **安装时出现"library not found"或"cannot link executable"错误**
 这是 libpcre 崩溃问题。完全关闭 Termux，重新打开，运行 `pkg upgrade -y`，然后重新运行脚本。
 
+**出现"Unable to contact settings server"或"Failed to connect to socket .../dbus-XXXX: Connection refused"**
+桌面的设置守护进程通过 D-Bus 会话总线通信。要么总线没有启动，要么上一次会话被强制杀死后留下了失效的 socket，而桌面仍在尝试复用它。现在 `start-linux.sh` 会先清理残留状态，再在固定地址上启动总线，然后才启动桌面。如果你用的是旧版脚本，重新运行 `termux-linux-setup.sh` 以重新生成启动脚本，或手动修复：
+
+```bash
+pkg install dbus
+pkill -9 -f dbus-daemon
+rm -rf ~/.dbus "$PREFIX"/tmp/dbus-*
+mkdir -p "$PREFIX/var/run/dbus"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$PREFIX/var/run/dbus/session_bus_socket"
+dbus-daemon --session --address="$DBUS_SESSION_BUS_ADDRESS" --nopidfile --fork
+```
+
+**Vulkan / Mesa 包安装失败：提示"vulkan-loader-generic : Conflicts: vulkan-loader-android"，或 dpkg 报"trying to overwrite libvulkan_freedreno.so"**
+这是两个独立的原因，现在都已修复：
+
+- `vulkan-loader-generic` 同时 *provides* 和 *conflicts* `vulkan-loader-android`，因此在正常安装环境下请求 android 版本会让整个事务失败，且毫无收益。脚本现在直接安装 `vulkan-loader-generic`。
+- 第三方的 `mesa-zink-vulkan-icd-freedreno`（Mesa 22）与主仓库的 Turnip 驱动（Mesa 26）打包了同名的 `libvulkan_freedreno.so`，同时安装会让 dpkg 中止。脚本现在只选择其中一套并始终保持一致。
+
+如果你的安装早于此修复，GPU 加速大概率仍然可用 — 这两个报错声势很大但并不致命。重新运行脚本即可清理。
+
 **包安装失败，提示"unmet dependencies"或"Conflicts"**
-脚本的 `safe_install_pkg` 函数会自动读取 apt 的冲突声明，跳过可能导致系统异常的包。如果仍然出现此问题，请查看日志并提交 GitHub Issue，附上你的设备型号和安卓版本。
+脚本的 `safe_install_pkg` 函数会读取每个包声明的冲突，正确处理版本约束，并允许 apt 执行该包合法替换（Replaces）的冲突。如果仍然出现此问题，请查看日志并提交 GitHub Issue，附上你的设备型号和安卓版本。
 
 **音频不工作**
 桌面出现后等待 5–10 秒。PulseAudio 首次启动需要一点时间来初始化。
