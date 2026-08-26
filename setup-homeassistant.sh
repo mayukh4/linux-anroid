@@ -23,6 +23,7 @@ TERMUX_HOME="${HOME:-/data/data/com.termux/files/home}"
 # ============== CONFIGURATION ==============
 CURRENT_STEP=0
 TOTAL_STEPS=7
+INSTALL_HACS="no"
 
 LOG_FILE="$TERMUX_HOME/termux-setup.log"
 
@@ -208,7 +209,25 @@ preflight_checks() {
     fi
 
     echo ""
-    log "Preflight OK: arch=$arch, free=${free_mb}MB, ip=$PHONE_IP"
+
+    # Ask now rather than after a 30-minute install.
+    echo -e "${CYAN}Optional: install HACS (Home Assistant Community Store)?${NC}"
+    echo -e "  ${GRAY}HACS is the add-on store for community integrations and themes.${NC}"
+    echo -e "  ${GRAY}It must be installed BEFORE any other custom integration.${NC}"
+    echo ""
+    while true; do
+        read -rp "  Install HACS? (y/n) [default: y]: " HACS_INPUT
+        HACS_INPUT=${HACS_INPUT:-y}
+        case "$HACS_INPUT" in
+            [Yy]*) INSTALL_HACS="yes"; echo -e "  ${GREEN}✔ HACS will be installed.${NC}"; break;;
+            [Nn]*) INSTALL_HACS="no";  echo -e "  ${GRAY}  HACS skipped.${NC}"; break;;
+            *) echo -e "  ${RED}Please enter y or n.${NC}";;
+        esac
+    done
+    [ "$INSTALL_HACS" == "yes" ] && TOTAL_STEPS=8
+
+    echo ""
+    log "Preflight OK: arch=$arch, free=${free_mb}MB, ip=$PHONE_IP, hacs=$INSTALL_HACS"
 }
 
 # ============== STEP 1: INSTALL PROOT-DISTRO ==============
@@ -224,16 +243,16 @@ step_proot() {
 # ============== STEP 2: INSTALL UBUNTU ==============
 step_ubuntu() {
     update_progress
-    echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Setting up Ubuntu 24.04 container...${NC}"
+    echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Setting up Ubuntu container...${NC}"
     echo ""
 
     # Check if Ubuntu is already installed
     if proot-distro list 2>/dev/null | grep -q "ubuntu.*Installed"; then
-        printf "  ${GRAY}~${NC}  %-55s ${GRAY}(already installed)${NC}\n" "Ubuntu 24.04"
+        printf "  ${GRAY}~${NC}  %-55s ${GRAY}(already installed)${NC}\n" "Ubuntu container"
         log "SKIP (already installed): Ubuntu proot"
     else
         (proot-distro install ubuntu >> "$LOG_FILE" 2>&1) &
-        spinner $! "Downloading and installing Ubuntu 24.04..."
+        spinner $! "Downloading and installing Ubuntu..."
     fi
 
     # Update package lists inside Ubuntu
@@ -396,9 +415,115 @@ echo "[*] Home Assistant stopped."
 STOPEOF
     chmod +x "$TERMUX_HOME/stop-homeassistant.sh"
     echo -e "  ${GREEN}✔ Created ~/stop-homeassistant.sh${NC}"
+
+    # upgrade-homeassistant.sh
+    # pip will only ever resolve to the newest release whose requires-python
+    # your container's interpreter satisfies, so this upgrades you as far as
+    # that Python allows and then says so. See README ("Upgrading Home
+    # Assistant") for the version/Python mapping.
+    cat > "$TERMUX_HOME/upgrade-homeassistant.sh" << UPGRADEEOF
+#!${TERMUX_PREFIX}/bin/bash
+echo ""
+echo "[*] Upgrading Home Assistant Core..."
+echo ""
+
+echo "[*] Stopping any running instance..."
+pkill -f "hass -c" 2>/dev/null || true
+sleep 2
+
+BEFORE=\$(proot-distro login ubuntu -- ${HASS_BIN} --version 2>/dev/null)
+PYVER=\$(proot-distro login ubuntu -- ${TERMUX_HOME}/hass-venv/bin/python --version 2>/dev/null)
+
+echo "[*] Container Python : \${PYVER:-unknown}"
+echo "[*] Current HA       : \${BEFORE:-unknown}"
+echo ""
+echo "[*] This can take 10-20 minutes. Keep the screen on."
+echo ""
+
+if command -v termux-wake-lock &>/dev/null; then termux-wake-lock; fi
+
+proot-distro login ubuntu -- ${TERMUX_HOME}/hass-venv/bin/pip install --upgrade homeassistant
+
+AFTER=\$(proot-distro login ubuntu -- ${HASS_BIN} --version 2>/dev/null)
+
+if command -v termux-wake-unlock &>/dev/null; then termux-wake-unlock; fi
+
+echo ""
+echo "-----------------------------------------------------"
+echo "  Before : \${BEFORE:-unknown}"
+echo "  After  : \${AFTER:-unknown}"
+echo "-----------------------------------------------------"
+if [ "\$BEFORE" = "\$AFTER" ]; then
+    echo ""
+    echo "  No change. You are already on the newest release that"
+    echo "  \${PYVER:-your Python} can run. Home Assistant 2026.3 and later"
+    echo "  need Python 3.14.2+; 2026.2.x is the last release for 3.13."
+    echo "  See the README section \"Upgrading Home Assistant\"."
+fi
+echo ""
+echo "[*] Start again with: bash ~/start-homeassistant.sh"
+echo ""
+UPGRADEEOF
+    chmod +x "$TERMUX_HOME/upgrade-homeassistant.sh"
+    echo -e "  ${GREEN}✔ Created ~/upgrade-homeassistant.sh${NC}"
 }
 
-# ============== STEP 7: VERIFY INSTALLATION ==============
+# ============== STEP 7 (OPTIONAL): HACS ==============
+#
+# HACS is the community add-on store. Two things matter, both learned the hard
+# way in issue #2:
+#   1. It must be installed before any other custom integration. If
+#      custom_components already has hand-installed integrations in it, the
+#      HACS installer can leave you with a broken setup.
+#   2. The official installer writes into the HA *config* directory, so it has
+#      to run with that directory as the working directory.
+step_hacs() {
+    update_progress
+    echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Installing HACS...${NC}"
+    echo ""
+
+    local HASS_CONFIG="${TERMUX_HOME}/hass-config"
+
+    if proot-distro login ubuntu -- test -d "${HASS_CONFIG}/custom_components/hacs"; then
+        printf "  ${GRAY}~${NC}  %-55s ${GRAY}(already installed)${NC}\n" "HACS"
+        log "SKIP (already installed): HACS"
+        return 0
+    fi
+
+    # Warn about pre-existing custom integrations rather than silently
+    # stepping on them.
+    local existing
+    existing=$(proot-distro login ubuntu -- sh -c \
+        "ls -1 ${HASS_CONFIG}/custom_components 2>/dev/null | grep -v '^hacs$' | head -5")
+    if [ -n "$existing" ]; then
+        echo -e "  ${YELLOW}⚠${NC}  custom_components already contains:"
+        echo "$existing" | sed 's/^/       /'
+        echo -e "  ${YELLOW}   HACS expects to be installed first. If HACS misbehaves, remove${NC}"
+        echo -e "  ${YELLOW}   those directories and re-run this script.${NC}"
+        log "WARNING: pre-existing custom_components: $existing"
+    fi
+
+    proot_install_pkg "wget" "wget (Ubuntu)"
+
+    (proot-distro login ubuntu -- sh -c \
+        "cd ${HASS_CONFIG} && wget -q -O - https://get.hacs.xyz | bash -" \
+        >> "$LOG_FILE" 2>&1) &
+    spinner $! "Downloading and installing HACS..."
+
+    if proot-distro login ubuntu -- test -d "${HASS_CONFIG}/custom_components/hacs"; then
+        echo -e "  ${GREEN}✔${NC}  HACS installed."
+        echo -e "    ${GRAY}Finish setup in the dashboard: Settings -> Devices & Services${NC}"
+        echo -e "    ${GRAY}-> Add Integration -> HACS (restart HA first).${NC}"
+        log "HACS installed OK"
+    else
+        echo -e "  ${YELLOW}⚠${NC}  HACS install did not complete — see $LOG_FILE."
+        echo -e "    ${GRAY}You can retry manually:${NC}"
+        echo -e "    ${GRAY}proot-distro login ubuntu -- sh -c \"cd ${HASS_CONFIG} && wget -O - https://get.hacs.xyz | bash -\"${NC}"
+        log "WARNING: HACS install incomplete"
+    fi
+}
+
+# ============== FINAL STEP: VERIFY INSTALLATION ==============
 step_verify() {
     update_progress
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Verifying installation...${NC}"
@@ -410,12 +535,38 @@ step_verify() {
         echo -e "  ${GREEN}✔${NC}  Home Assistant binary found."
         log "Verification OK: hass binary found"
 
-        local HA_VERSION
+        local HA_VERSION PY_VERSION
         HA_VERSION=$(proot-distro login ubuntu -- ${TERMUX_HOME}/hass-venv/bin/hass --version 2>/dev/null)
+        PY_VERSION=$(proot-distro login ubuntu -- ${TERMUX_HOME}/hass-venv/bin/python --version 2>/dev/null | awk '{print $2}')
+
         if [ -n "$HA_VERSION" ]; then
-            echo -e "  ${GREEN}✔${NC}  Version: ${WHITE}${HA_VERSION}${NC}"
+            echo -e "  ${GREEN}✔${NC}  Home Assistant: ${WHITE}${HA_VERSION}${NC}"
             log "HA version: $HA_VERSION"
         fi
+        if [ -n "$PY_VERSION" ]; then
+            echo -e "  ${GREEN}✔${NC}  Container Python: ${WHITE}${PY_VERSION}${NC}"
+            log "Container Python: $PY_VERSION"
+        fi
+
+        # pip installs the newest release whose requires-python your
+        # interpreter satisfies, and stops there. That is why a fresh install
+        # can land on an older HA than the one on the website — it is not a
+        # broken install. (issue #2)
+        case "$PY_VERSION" in
+            3.13.*)
+                echo ""
+                echo -e "  ${YELLOW}⚠${NC}  Python 3.13 caps you at Home Assistant 2026.2.x."
+                echo -e "     ${GRAY}2026.3 and later need Python 3.14.2+. This is expected,${NC}"
+                echo -e "     ${GRAY}not a failed install. See the README section${NC}"
+                echo -e "     ${GRAY}\"Upgrading Home Assistant\" for the Python 3.14 route.${NC}"
+                ;;
+            3.1[0-2].*)
+                echo ""
+                echo -e "  ${YELLOW}⚠${NC}  Python ${PY_VERSION} caps you at Home Assistant 2025.1.x."
+                echo -e "     ${GRAY}HA 2025.2+ requires 3.13, 2025.6+ requires 3.13.2,${NC}"
+                echo -e "     ${GRAY}2026.3+ requires 3.14.2. See the README.${NC}"
+                ;;
+        esac
     else
         echo -e "  ${RED}✘${NC}  Home Assistant binary not found."
         echo -e "    ${WHITE}Check $LOG_FILE for pip install errors.${NC}"
@@ -445,8 +596,9 @@ COMPLETE
     echo -e "${NC}"
 
     echo -e "${YELLOW}  ─────────────────────────────────────────────────${NC}"
-    echo -e "  ${WHITE}▶  START:${NC}  ${GREEN}bash ~/start-homeassistant.sh${NC}"
-    echo -e "  ${WHITE}■  STOP: ${NC}  ${GREEN}bash ~/stop-homeassistant.sh${NC}"
+    echo -e "  ${WHITE}▶  START:${NC}    ${GREEN}bash ~/start-homeassistant.sh${NC}"
+    echo -e "  ${WHITE}■  STOP: ${NC}    ${GREEN}bash ~/stop-homeassistant.sh${NC}"
+    echo -e "  ${WHITE}▲  UPGRADE:${NC}  ${GREEN}bash ~/upgrade-homeassistant.sh${NC}"
     echo -e "${YELLOW}  ─────────────────────────────────────────────────${NC}"
     echo ""
     echo -e "  ${CYAN}Access the dashboard from any device on your network:${NC}"
@@ -455,6 +607,19 @@ COMPLETE
     echo -e "  ${CYAN}First launch takes 5–10 minutes to initialize.${NC}"
     echo -e "  ${CYAN}You'll create your admin account in the browser.${NC}"
     echo ""
+    if [ "$INSTALL_HACS" == "yes" ]; then
+        echo -e "${YELLOW}  ─────────────────────────────────────────────────${NC}"
+        echo -e "  ${WHITE}FINISHING HACS SETUP${NC}"
+        echo -e "${YELLOW}  ─────────────────────────────────────────────────${NC}"
+        echo ""
+        echo -e "    1. Restart Home Assistant (stop, then start)"
+        echo -e "    2. Dashboard → Settings → Devices & Services"
+        echo -e "    3. \"+ Add Integration\" → search \"HACS\""
+        echo -e "    4. Tick all the acknowledgements, then authorize with GitHub"
+        echo ""
+        echo -e "    ${GRAY}Docs: https://www.hacs.xyz/docs/use/configuration/basic/${NC}"
+        echo ""
+    fi
     echo -e "${YELLOW}  ─────────────────────────────────────────────────${NC}"
     echo -e "  ${WHITE}ADDING YOUR SMART DEVICES${NC}"
     echo -e "${YELLOW}  ─────────────────────────────────────────────────${NC}"
@@ -512,6 +677,7 @@ main() {
     step_homeassistant
     step_ha_config
     step_launchers
+    [ "$INSTALL_HACS" == "yes" ] && step_hacs
     step_verify
     show_completion
 
