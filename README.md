@@ -1,5 +1,7 @@
 # Repurpose Your Old Android Phone
 
+**[中文文档](README.zh.md)**
+
 Turn any old Android phone into a **Linux desktop** or a **smart home server** — no PC, no root, no cloud. Just [Termux](https://termux.dev).
 
 > Created to accompany a YouTube video walkthrough. Timestamps are referenced in the video description.
