@@ -1,0 +1,31 @@
+name: shellcheck
+
+on:
+  push:
+    paths: ["**.sh", ".github/workflows/shellcheck.yml"]
+  pull_request:
+    paths: ["**.sh", ".github/workflows/shellcheck.yml"]
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      # bash -n catches the failure that actually matters here: a syntax error
+      # that would strand someone half-way through a 30-minute install.
+      - name: Syntax check
+        run: |
+          for f in *.sh; do
+            echo "== $f"
+            bash -n "$f"
+          done
+
+      # shellcheck runs at error severity only. These scripts intentionally
+      # avoid `set -e`/`set -u` (see the header comment in termux-linux-setup.sh),
+      # which trips a lot of shellcheck's style and info-level advice.
+      - name: shellcheck
+        run: shellcheck --severity=error --shell=bash *.sh

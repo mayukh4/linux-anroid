@@ -1,0 +1,73 @@
+name: Bug report
+description: Something failed during install or the desktop / Home Assistant misbehaves
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: the install log at `~/termux-setup.log` almost always names the
+        exact package or step that failed. Please attach it — it turns guesswork into a fix.
+
+  - type: dropdown
+    id: script
+    attributes:
+      label: Which script?
+      options:
+        - termux-linux-setup.sh (Linux desktop)
+        - setup-homeassistant.sh (Home Assistant)
+        - Both / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you expected, and what you got instead. Paste the exact error text.
+      placeholder: |
+        Expected: desktop to open in Termux-X11
+        Got: "Unable to contact settings server"
+    validations:
+      required: true
+
+  - type: textarea
+    id: device
+    attributes:
+      label: Device info
+      description: |
+        Run this in Termux and paste the output:
+        ```
+        echo "Device: $(getprop ro.product.brand) $(getprop ro.product.model)"
+        echo "Android: $(getprop ro.build.version.release)"
+        echo "ABI: $(getprop ro.product.cpu.abi)"
+        echo "EGL: $(getprop ro.hardware.egl) / $(getprop ro.hardware)"
+        echo "RAM: $(free -h 2>/dev/null | awk 'NR==2{print $2}')"
+        ```
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: de
+    attributes:
+      label: Desktop environment chosen
+      options: ["XFCE4", "LXQt", "MATE", "KDE Plasma", "N/A — Home Assistant"]
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Install log
+      description: Attach `~/termux-setup.log`, or paste the last ~50 lines.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I ran `pkg update && pkg upgrade -y` and restarted Termux before running the script
+          required: true
+        - label: I checked the README Troubleshooting section
+          required: true

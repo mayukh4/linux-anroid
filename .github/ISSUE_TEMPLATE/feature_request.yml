@@ -1,0 +1,24 @@
+name: Feature request
+description: Suggest a desktop, package, driver, or integration to support
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like to see?
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why does it help?
+      description: What can you do with it that you can't do today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything you've already tried
+      description: Package names, commands, links to Termux/TUR packages — all useful.

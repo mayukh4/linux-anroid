@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Termux packaging problems
+    url: https://github.com/termux/termux-packages/issues
+    about: If a Termux package itself is broken or missing, report it upstream.
+  - name: Termux-X11 display problems
+    url: https://github.com/termux/termux-x11/issues
+    about: Black screens, input lag, and rendering bugs in the X11 app itself.
+  - name: Home Assistant integrations
+    url: https://community.home-assistant.io
+    about: Questions about specific HA integrations rather than this installer.

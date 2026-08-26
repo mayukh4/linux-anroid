@@ -1,5 +1,17 @@
-CLAUDE.md
+# Editor / OS cruft
 .DS_Store
+*.swp
+*~
+
+# Agent + video-production notes (not part of the project)
+CLAUDE.md
+.claude/
 thumbnail_assets/
 VIDEO_OUTLINE_AND_THUMBNAIL.md
+REDDIT_STRATEGY.md
+SHOOTING_LIST.md
 Youtube script on Linux on Android + HA.pdf
+
+# Logs produced by the scripts
+termux-setup.log
+homeassistant-setup.log
